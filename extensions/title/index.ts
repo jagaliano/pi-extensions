@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { completeArguments, completeModelArgument } from "./completions.ts";
-import { configPath, loadConfig, saveConfig, type Config } from "./config.js";
+import { configPath, DEFAULT_CONFIG, loadConfig, saveConfig, type Config } from "./config.js";
 import { cleanTitle, countCompletedExchanges, firstCompletedExchange, recentTranscript, TITLE_SYSTEM_PROMPT } from "./title.js";
 
 type TitleSource = { user: string; assistant?: string };
@@ -10,6 +10,9 @@ type TitleSource = { user: string; assistant?: string };
 type TitleRequestSource =
   | ({ kind: "initial" } & TitleSource)
   | { kind: "refresh"; transcript: string };
+
+/** Widget slot used for the current title, so redraws replace it instead of stacking. */
+const INDICATOR_WIDGET_KEY = "title";
 
 const AUTOMATIC_MODEL_CANDIDATES = [
   "openai/gpt-5-nano",
@@ -311,6 +314,10 @@ export default function titleExtension(pi: ExtensionAPI) {
   let lastEvaluatedTurns = 0;
   /** Set when the session arrived named, or the user named it. */
   let pinned = false;
+  /** Cached from configuration so the widget can be redrawn without awaiting a read. */
+  let widgetVisible = DEFAULT_CONFIG.showWidget;
+  /** The configuration read started at session start, handed to the first evaluation. */
+  let startupConfigRead: Promise<Config> | undefined;
 
   function isStaleContextError(error: unknown): boolean {
     return error instanceof Error && error.message.startsWith("This extension ctx is stale");
@@ -324,11 +331,41 @@ export default function titleExtension(pi: ExtensionAPI) {
     return !pinned && pi.getSessionName() === lastAutoName;
   }
 
+  /**
+   * Show or clear the title widget. Rendering is cosmetic, so a context that has already
+   * been invalidated must not turn a failure here into a broken turn.
+   */
+  function syncWidget(ctx: ExtensionContext): void {
+    try {
+      const title = pi.getSessionName();
+      const line = widgetVisible && title
+        ? ctx.ui.theme.fg("accent", `● Title: ${title}`)
+        : undefined;
+      ctx.ui.setWidget(INDICATOR_WIDGET_KEY, line ? [line] : undefined, { placement: "belowEditor" });
+    } catch {
+      // Ignore: the widget is advisory.
+    }
+  }
+
+  /** Notify without assuming the context survived an asynchronous step. */
+  function notifySafely(
+    ctx: ExtensionContext,
+    message: string,
+    level: "info" | "warning" | "error" = "info",
+  ): void {
+    try {
+      ctx.ui.notify(message, level);
+    } catch {
+      // The session may have been replaced while a command or turn was running.
+    }
+  }
+
   function setTitle(ctx: ExtensionContext, title: string): void {
     pinned = true;
     pi.setSessionName(title);
     applyTerminalTitle(ctx, title);
     deferTerminalTitle(ctx);
+    syncWidget(ctx);
     ctx.ui.notify(`Session title: ${title}`, "info");
   }
 
@@ -399,6 +436,7 @@ export default function titleExtension(pi: ExtensionAPI) {
         if (!pinned) pi.appendEntry<TitleEntry>(TITLE_ENTRY, { title });
         applyTerminalTitle(ctx, title);
         deferTerminalTitle(ctx);
+        syncWidget(ctx);
         if (candidate.source === "session" && ctx.hasUI) {
           ctx.ui.notify(
             `Title model fallback: ${failures.join("; ")}; used ${candidate.model.provider}/${candidate.model.id}`,
@@ -473,7 +511,11 @@ export default function titleExtension(pi: ExtensionAPI) {
       if (openingRequest !== undefined && lastAutoName !== undefined) return;
 
       const branch = ctx.sessionManager.getBranch();
-      const config = await loadConfig();
+      // The read started at session start is handed over here so the first evaluation
+      // does not pay for a second configuration snapshot.
+      const startupRead = startupConfigRead;
+      startupConfigRead = undefined;
+      const config = await (startupRead ?? loadConfig());
       if (lifecycle !== expectedLifecycle || !config.enabled || !canWriteAutomatic()) return;
 
       const turns = countCompletedExchanges(branch);
@@ -498,7 +540,7 @@ export default function titleExtension(pi: ExtensionAPI) {
     }
   }
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     completionContext = ctx;
     resetGeneration();
     // A resumed automatic title keeps refreshing, rebased on the active branch. Any other
@@ -508,8 +550,19 @@ export default function titleExtension(pi: ExtensionAPI) {
     lastAutoName = automatic ? name : undefined;
     lastEvaluatedTurns = automatic ? countCompletedExchanges(ctx.sessionManager.getBranch()) : 0;
     pinned = name !== undefined && !automatic;
+    // Deferred so an existing terminal title is restored without waiting on I/O.
     deferTerminalTitle(ctx);
-
+    // The preference is read before the first widget paint, so a hidden widget is never
+    // drawn and then cleared.
+    const configRead = loadConfig();
+    startupConfigRead = configRead;
+    try {
+      widgetVisible = (await configRead).showWidget;
+    } catch {
+      // An unreadable configuration keeps the last known preference. The evaluation
+      // handed this read fails the same way it would have on a read of its own.
+    }
+    syncWidget(ctx);
   });
 
   pi.on("session_shutdown", () => {
@@ -519,6 +572,7 @@ export default function titleExtension(pi: ExtensionAPI) {
 
   pi.on("session_info_changed", (event, ctx) => {
     if (event.name !== undefined && event.name !== lastAutoName) pinned = true;
+    syncWidget(ctx);
     deferTerminalTitle(ctx);
   });
 
@@ -539,7 +593,7 @@ export default function titleExtension(pi: ExtensionAPI) {
   pi.on("agent_settled", (_event, ctx) => evaluateAutomatic(ctx));
 
   pi.registerCommand("title", {
-    description: "[status | on | off | model [provider/model[:thinking]|auto|active] | every [turns|off] | regenerate | set <title>] — Set or configure titles",
+    description: "[status | on | off | model [provider/model[:thinking]|auto|active] | every [turns|off] | regenerate | set <title> | show | hide] — Set or configure titles",
     getArgumentCompletions: (prefix) => {
       if (/^every\s/i.test(prefix)) {
         return completeArguments(prefix, [
@@ -565,6 +619,8 @@ export default function titleExtension(pi: ExtensionAPI) {
         { value: "every ", label: "every", description: "Show or set the refresh interval" },
         { value: "regenerate", label: "regenerate", description: "Generate a replacement title" },
         { value: "set ", label: "set <title>", description: "Set a title matching a subcommand name" },
+        { value: "show", label: "show", description: "Show the session title widget" },
+        { value: "hide", label: "hide", description: "Hide the session title widget" },
       ]);
     },
     handler: async (args, ctx) => {
@@ -572,7 +628,7 @@ export default function titleExtension(pi: ExtensionAPI) {
       const [action, ...rest] = input.split(/\s+/).filter(Boolean);
 
       try {
-        const configActions = new Set(["status", "on", "off", "model", "every", "regenerate", "set"]);
+        const configActions = new Set(["status", "on", "off", "model", "every", "regenerate", "set", "show", "hide"]);
         if (action && !configActions.has(action)) {
           setTitle(ctx, input);
           return;
@@ -586,6 +642,10 @@ export default function titleExtension(pi: ExtensionAPI) {
         }
 
         const config = await loadConfig();
+        // Adopting a freshly read preference also repaints, so the widget cannot keep
+        // rendering a state the configuration no longer describes.
+        widgetVisible = config.showWidget;
+        syncWidget(ctx);
         if (!action || action === "status") {
           ctx.ui.notify(
             [
@@ -593,10 +653,23 @@ export default function titleExtension(pi: ExtensionAPI) {
               `enabled: ${config.enabled}`,
               `model: ${config.model ?? "active session model"}`,
               `refresh turns: ${config.refreshTurns}`,
+              `widget: ${config.showWidget ? "enabled" : "disabled"}`,
               `config: ${configPath()}`,
             ].join("\n"),
             "info",
           );
+          return;
+        }
+
+        if (action === "show" || action === "hide") {
+          const show = action === "show";
+          // Save first: a failed write must not leave the widget following a preference
+          // that was never stored.
+          await saveConfig({ ...config, showWidget: show });
+          config.showWidget = show;
+          widgetVisible = show;
+          syncWidget(ctx);
+          notifySafely(ctx, `Session title widget ${show ? "shown" : "hidden"}`, "info");
           return;
         }
 
@@ -651,7 +724,7 @@ export default function titleExtension(pi: ExtensionAPI) {
           return;
         }
       } catch (error) {
-        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        notifySafely(ctx, error instanceof Error ? error.message : String(error), "error");
       }
     },
   });
